@@ -1,0 +1,17 @@
+{
+  "source_dataset": "/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/synthetic_telemetry_data.csv",
+  "cutoff_timestamp": "2024-02-05T00:00:00.000000000",
+  "artifacts": {
+    "classification_report": "/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/output/artifacts/classification_report.json",
+    "classification_confusion_matrix": "/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/output/artifacts/classification_confusion_matrix.csv",
+    "regression_metrics": "/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/output/artifacts/regression_metrics.json",
+    "engineered_features_full": "/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/output/artifacts/engineered_features_full.csv",
+    "realtime_scores_csv": "/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/output/artifacts/realtime_scores_VEH0049.csv"
+  },
+  "figures": {
+    "classification_feature_importances": "/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/output/figures/classification_feature_importances.png",
+    "regression_feature_importances": "/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/output/figures/regression_feature_importances.png",
+    "realtime_risk": "/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/output/figures/realtime_risk_VEH0049.png",
+    "realtime_rul": "/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/output/figures/realtime_rul_VEH0049.png"
+  }
+}
