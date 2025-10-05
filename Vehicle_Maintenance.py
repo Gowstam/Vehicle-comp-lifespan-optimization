@@ -1,25 +1,28 @@
 """
-Predictive Maintenance — 7-Day 
-- Classification: engine/battery/brake fail in next 7d (3 models) — RandomForest
-- Regression: engine/battery/brake RUL days (3 models) — XGBoost
+Predictive Maintenance — 7-Day
+- ONE classification model (multi-label): predicts fail_in_next_7d for engine, battery, brake
+- ONE regression model (multi-output): predicts RUL_days for engine, battery, brake (XGBoost)
+- Keeps your preprocessing + feature engineering
 """
 
 import os
 import re
 import json
-from typing import List, Optional
-
+from typing import List, Optional, Tuple, Dict
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
+from sklearn.metrics import (classification_report, confusion_matrix, roc_auc_score, average_precision_score, mean_absolute_error, mean_squared_error)
 from xgboost import XGBRegressor
-from imblearn.over_sampling import RandomOverSampler
-from sklearn.metrics import (classification_report,confusion_matrix,roc_auc_score,average_precision_score,mean_absolute_error,mean_squared_error)
+import joblib
 
-CSV_PATH= os.environ.get("CSV_PATH","/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/synthetic_telemetry_data.csv")
-OUT_DIR = os.environ.get("OUT_DIR","/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/output_simple",)
+# Configuration 
+CSV_PATH = os.environ.get("CSV_PATH","/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/synthetic_telemetry_data.csv",
+)
+OUT_DIR = os.environ.get("OUT_DIR", "/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/output_simple")
 FIG_DIR = os.path.join(OUT_DIR, "figures")
 ART_DIR = os.path.join(OUT_DIR, "artifacts")
 for d in [OUT_DIR, FIG_DIR, ART_DIR]:
@@ -27,10 +30,11 @@ for d in [OUT_DIR, FIG_DIR, ART_DIR]:
 
 COMPONENTS = ["engine", "battery", "brake"]
 HORIZON = 7
-RUL_CAP = 7
+# For training target capping of RUL:
+RUL_CAP = 30
 RANDOM_STATE = 42
 
-# Configuring Timestamp and Failure Date 
+# Timestamp & Failure Date 
 def regenerate_daily_timestamps(df):
     d = df.copy()
     if "timestamp" in d.columns:
@@ -43,7 +47,6 @@ def regenerate_daily_timestamps(df):
 def rebuild_failure_date_column(d):
     df = d.copy()
     ft = (df.get("failure_type").astype(str).str.lower().str.strip().str.replace(r"\s+", " ", regex=True))
-
     is_engine = ft.str.contains(r"\bengine_failed\b", regex=True)
     is_brake  = ft.str.contains(r"\bbrake_failed\b", regex=True)
     is_batt   = ft.str.contains(r"\bbattery_failed\b", regex=True)
@@ -51,39 +54,35 @@ def rebuild_failure_date_column(d):
 
     df["failure_date"] = "NA"
     if "timestamp" in df.columns:
-        df.loc[(is_engine | is_brake | is_batt), "failure_date"] = pd.to_datetime(
-            df.loc[(is_engine | is_brake | is_batt), "timestamp"]).dt.strftime("%Y-%m-%d")
+        df.loc[(is_engine | is_brake | is_batt), "failure_date"] = pd.to_datetime(df.loc[(is_engine | is_brake | is_batt), "timestamp"]).dt.strftime("%Y-%m-%d")
     df.loc[is_no, "failure_date"] = "NA"
     return df
 
-# Preprocessing
+# Preprocessing 
 
-def daily_timestamps(df):
+def daily_timestamps(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
-    d["timestamp"] = pd.to_datetime(d["timestamp"], errors="coerce") #timestamp column is converted to pandas datetime64 type.
+    d["timestamp"] = pd.to_datetime(d["timestamp"], errors="coerce")
     return d
 
-def build_component_labels(input_df, component, horizon_days, include_today,):
+def build_component_labels(input_df,component, horizon_days,include_today):
     """
-    Adds target features: <component>_RUL_days, <component>_fail_in_next_{horizon_days}d
+    Adds: <component>_RUL_days, <component>_fail_in_next_{horizon_days}d
     """
     df_tmp = daily_timestamps(input_df)
 
-    # If any of these columns exist, convert them to int (0/1).
+    # normalize boolean flags
     for c in ["abs_fault_indicator", "engine_failure_imminent", "brake_issue_imminent", "battery_issue_imminent"]:
         if c in df_tmp.columns:
             df_tmp[c] = pd.to_numeric(df_tmp[c], errors="coerce").fillna(0).astype(int)
 
     token = f"{component}_failed"
-    df_tmp[f"{component}_failed"] = (
-        df_tmp.get("failure_type")
-              .astype(str).str.lower().str.strip().str.contains(fr"\b{re.escape(token)}\b", regex=True, na=False).astype(int))
+    df_tmp[f"{component}_failed"] = (df_tmp.get("failure_type").astype(str).str.lower().str.strip()
+                                     .str.contains(fr"\b{re.escape(token)}\b", regex=True, na=False).astype(int))
 
-    #If a failure_date column exists, convert it to datetime (normalized to midnight)
-    
-    fail_date_col = pd.to_datetime(df_tmp["failure_date"], errors="coerce").dt.normalize()
+    # event date = current row timestamp for failure rows
     event_date = pd.to_datetime(df_tmp["timestamp"], errors="coerce").dt.normalize()
-    df_tmp["_comp_event_date"] = pd.to_datetime(event_date) # actual failure date to use later when calculating (RUL).
+    df_tmp["_comp_event_date"] = pd.to_datetime(event_date)
     df_tmp["date_norm"] = pd.to_datetime(df_tmp["timestamp"]).dt.normalize()
 
     def per_vehicle(g):
@@ -98,21 +97,25 @@ def build_component_labels(input_df, component, horizon_days, include_today,):
             next_fail_dates[has_next] = fail_dates[idxs[has_next]]
             day_gap = (next_fail_dates - cur_dates) / np.timedelta64(1, "D")
             rul_days_full = day_gap.astype(float)
-        mask_keep = ((rul_days_full >= 0) & (rul_days_full <= horizon_days)) if include_today \
-                    else ((rul_days_full > 0)  & (rul_days_full <= horizon_days))
+
+        if include_today:
+            mask_keep = (rul_days_full >= 0) & (rul_days_full <= horizon_days)
+        else:
+            mask_keep = (rul_days_full > 0) & (rul_days_full <= horizon_days)
+
         g[f"{component}_RUL_days"] = rul_days_full
         g[f"{component}_fail_in_next_{horizon_days}d"] = mask_keep.astype(int)
         return g
 
     out = df_tmp.groupby("vehicle_id", group_keys=False).apply(per_vehicle)
-    return out.drop(columns=[
-    c for c in ["date_norm", "_comp_event_date"] if c in out.columns]) #Removes columns not needed for training.
+    return out.drop(columns=[c for c in ["date_norm", "_comp_event_date"] if c in out.columns])
 
 # Columns never to use as features
 EXCLUDE_ALWAYS = {"timestamp", "vehicle_id", "failure_type", "failure_date","brand", "date_norm", "next_fail_date"}
 
-def select_features(df_feat,extra_keep):
+def select_features(df_feat, extra_keep):
     exclude_cols = set(EXCLUDE_ALWAYS)
+
     leakage_cols = []
     for c in df_feat.columns:
         s = str(c)
@@ -122,18 +125,18 @@ def select_features(df_feat,extra_keep):
             leakage_cols.append(s)
         if s in ("engine_failed", "battery_failed", "brake_failed"):
             leakage_cols.append(s)
-    if extra_keep: 
+    if extra_keep:
         leakage_cols.extend(extra_keep)
+
     exclude_cols.update(leakage_cols)
 
     candidate_cols = [c for c in df_feat.columns if c not in exclude_cols]
     feature_cols = df_feat[candidate_cols].select_dtypes(include=[np.number]).columns.tolist()
     return sorted(set(feature_cols))
 
-def chronological_split(df_model, feature_cols, label_col, train_frac: float = 0.8):
-    
+def chronological_split(df_model, feature_cols, label_cols, train_frac: float = 0.8):
     train_parts, test_parts = [], []
-    for vid, g in df_model.groupby("vehicle_id"):
+    for _, g in df_model.groupby("vehicle_id"):
         g = g.sort_values("timestamp")
         cutoff_idx = int(len(g) * train_frac)
         train_parts.append(g.iloc[:cutoff_idx])
@@ -141,26 +144,29 @@ def chronological_split(df_model, feature_cols, label_col, train_frac: float = 0
     train_df = pd.concat(train_parts, ignore_index=True)
     test_df  = pd.concat(test_parts,  ignore_index=True)
     cutoff_ts = pd.to_datetime(train_df["timestamp"], errors="coerce").max()
+    X_train = train_df[feature_cols]
+    X_test  = test_df[feature_cols]
+    Y_train = train_df[label_cols]
+    Y_test  = test_df[label_cols]
+    return cutoff_ts, X_train, X_test, Y_train, Y_test
 
-    return (cutoff_ts,train_df[feature_cols],test_df[feature_cols],train_df[label_col],test_df[label_col])
-
-# ------------------ Optimized Feature Engineering ----------------------
+# Feature Engineering
 
 def add_features(input_df):
     df = input_df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
-    # Flag columns that has 0/1
-    FLAG_COLS = ["engine_failure_imminent", "brake_issue_imminent", "battery_issue_imminent", "abs_fault_indicator",
-                 "harsh_brakes", "harsh_accels"]
+    FLAG_COLS = ["engine_failure_imminent", "brake_issue_imminent", "battery_issue_imminent","abs_fault_indicator", "harsh_brakes", "harsh_accels"]
     for c in [c for c in FLAG_COLS if c in df.columns]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
 
-    BASE = ["engine_temp_c","engine_rpm","oil_pressure_psi","coolant_temp_c", "fuel_level_percent","fuel_consumption_lph","engine_load_percent", "throttle_pos_percent","air_flow_rate_gps","exhaust_gas_temp_c", "vibration_level","engine_hours", "brake_fluid_level_psi","brake_pad_wear_mm","brake_temp_c","brake_pedal_pos_percent", "wheel_speed_fl_kph","wheel_speed_fr_kph","wheel_speed_rl_kph","wheel_speed_rr_kph","vehicle_speed_kph", "battery_voltage_v","battery_current_a","battery_temp_c", "alternator_output_v", "battery_charge_percent","battery_health_percent", "ambient_temp_c","humidity_percent","odometer_reading"]
+    BASE = ["engine_temp_c","engine_rpm","oil_pressure_psi","coolant_temp_c","fuel_level_percent","fuel_consumption_lph","engine_load_percent",
+        "throttle_pos_percent","air_flow_rate_gps","exhaust_gas_temp_c","vibration_level","engine_hours",
+        "brake_fluid_level_psi","brake_pad_wear_mm","brake_temp_c","brake_pedal_pos_percent","wheel_speed_fl_kph","wheel_speed_fr_kph","wheel_speed_rl_kph","wheel_speed_rr_kph",
+        "vehicle_speed_kph","battery_voltage_v","battery_current_a","battery_temp_c","alternator_output_v","battery_charge_percent","battery_health_percent","ambient_temp_c","humidity_percent","odometer_reading"]
     cols = [c for c in BASE if c in df.columns]
 
     def rolling_slope(s, window):
-        #Slope per day from a quick linear fit over each rolling window.
         x = np.arange(window, dtype=float)
         x_mean = x.mean()
         denom = ((x - x_mean) ** 2).sum()
@@ -169,7 +175,6 @@ def add_features(input_df):
             if np.isnan(y).any() or denom == 0:
                 if np.isnan(y).all():
                     return np.nan
-            # slope = cov(x,y)/var(x)
             y = y.astype(float)
             y_mean = y.mean()
             num = ((x - x_mean) * (y - y_mean)).sum()
@@ -178,7 +183,6 @@ def add_features(input_df):
         return s.rolling(window, min_periods=window).apply(_fit, raw=True)
 
     def days_since(cond):
-        """Days since condition was True (per row)."""
         curr_idx = np.arange(len(cond))
         last = np.where(cond.values, curr_idx, np.nan)
         last = pd.Series(last).ffill().values
@@ -213,7 +217,7 @@ def add_features(input_df):
             neg_d1 = r.diff(1).clip(upper=0).cumsum().add_suffix("_cum_negdiff1")
             blocks.append(neg_d1)
 
-            # Days since last drop/spike 
+            # Days since last drop/spike
             drop = r.diff(1) < 0
             spike = r.diff(1) > 0
             ds_drop  = drop.apply(days_since).add_suffix("_days_since_drop")
@@ -221,11 +225,11 @@ def add_features(input_df):
             blocks += [ds_drop, ds_spike]
 
         # Fault flags cumulative counts
-        fcols = [c for c in FLAG_COLS if c in g.columns]
+        fcols = [c for c in ["engine_failure_imminent","brake_issue_imminent","battery_issue_imminent","abs_fault_indicator","harsh_brakes","harsh_accels"] if c in g.columns]
         if fcols:
             f = g[fcols]
             blocks += [
-                f.cumsum().add_suffix("_cum"),    # Creates cumulative counts and rolling sums over 7 and 14 days.
+                f.cumsum().add_suffix("_cum"),
                 f.rolling(7,  min_periods=1).sum().add_suffix("_sum7"),
                 f.rolling(14, min_periods=1).sum().add_suffix("_sum14"),
             ]
@@ -240,136 +244,183 @@ def add_features(input_df):
 
     return df.groupby("vehicle_id", group_keys=False).apply(per_vehicle)
 
-
 # Load Data 
 
 df_raw = pd.read_csv(CSV_PATH)
 df_raw = regenerate_daily_timestamps(df_raw)
 df_raw = rebuild_failure_date_column(df_raw)
 
-
-# Build Labels & Features
-
-# Build labels for 7d horizon only (also creates RUL columns)
+# Features Build 
 df_labeled_all = df_raw.copy()
 for comp in COMPONENTS:
     df_labeled_all = build_component_labels(df_labeled_all, comp, horizon_days=HORIZON, include_today=True)
 
-labeled_csv = os.path.join(OUT_DIR, "telemetry_labeled_7d.csv") # Save labeled CSV
+labeled_csv = os.path.join(OUT_DIR, "telemetry_labeled_7d.csv")
 df_labeled_all.to_csv(labeled_csv, index=False)
 
 df_feat = add_features(df_labeled_all)
 df_feat = df_feat.replace([np.inf, -np.inf], np.nan)
 
-features_csv = os.path.join(OUT_DIR, "telemetry_labeled_with_features_7d.csv") # Save features CSV
+features_csv = os.path.join(OUT_DIR, "telemetry_labeled_with_features_7d.csv")
 df_feat.to_csv(features_csv, index=False)
 
-# Classification (3 models, 7d) 
-for component in COMPONENTS:
-    label_col = f"{component}_fail_in_next_{HORIZON}d"
-    df_tmp = df_feat
+# Build Targets
+# Classification labels (3 columns)
+CLS_LABEL_COLS = [f"{c}_fail_in_next_{HORIZON}d" for c in COMPONENTS]
+# Regression labels (3 columns)
+RUL_LABEL_COLS = [f"{c}_RUL_days" for c in COMPONENTS]
 
-    df_local = df_tmp.dropna(subset=[label_col]).copy()
-    df_local[label_col] = df_local[label_col].astype(int)
+# Feature Selection 
+all_labels = CLS_LABEL_COLS + RUL_LABEL_COLS
+feature_cols = select_features(df_feat, extra_keep=all_labels)
 
-    feature_cols = select_features(df_local, extra_keep=[label_col])
-    df_local[feature_cols] = df_local[feature_cols].replace([np.inf, -np.inf], np.nan).clip(-1e6, 1e6)
+df_feat[feature_cols] = (df_feat[feature_cols].replace([np.inf, -np.inf], np.nan).clip(-1e6, 1e6))
 
-    df_model = df_local.dropna(subset=feature_cols).copy()
-    
-    cutoff_ts, X_train, X_test, y_train, y_test = chronological_split(df_model, feature_cols, label_col)
+# Classification
+df_cls = df_feat.dropna(subset=CLS_LABEL_COLS).copy()
+for col in CLS_LABEL_COLS:
+    df_cls[col] = df_cls[col].astype(int)
 
-    ros = RandomOverSampler(sampling_strategy='auto', random_state=RANDOM_STATE)
-    X_train_os, y_train_os = ros.fit_resample(X_train, y_train)
+cutoff_ts, Xc_train, Xc_test, Yc_train, Yc_test = chronological_split(df_cls, feature_cols, CLS_LABEL_COLS)
 
-    clf = RandomForestClassifier(n_estimators=300, class_weight="balanced_subsample", random_state=RANDOM_STATE, n_jobs=-1)
-    clf.fit(X_train_os, y_train_os)
-    
-    # positive-class probability (if single-class training)
-    proba = clf.predict_proba(X_test)
-    classes = list(clf.classes_)
-    pos_idx = classes.index(1) if 1 in classes else 1
+# Multi-label classifier (3 binary outputs)
+base_rf = RandomForestClassifier(n_estimators=400,max_depth=None,class_weight="balanced_subsample",random_state=RANDOM_STATE,n_jobs=-1)
+clf_multi = MultiOutputClassifier(base_rf, n_jobs=None)
+clf_multi.fit(Xc_train, Yc_train)
 
-    y_prob = proba[:, pos_idx]
-    y_pred = (y_prob >= 0.5).astype(int)
+Yc_prob_list = clf_multi.predict_proba(Xc_test)
+Yc_pred = clf_multi.predict(Xc_test)
 
-    roc = roc_auc_score(y_test, y_prob) 
-    pr  = average_precision_score(y_test, y_prob)
-    metrics = {"roc_auc": float(roc),
-               "pr_auc":  float(pr)}
+print("\n===  Multi-label Classifier — 7d Failures (engine/battery/brake) ===")
+per_comp_metrics: Dict[str, Dict[str, float]] = {}
+for i, comp in enumerate(COMPONENTS):
+    y_true = Yc_test.iloc[:, i].values
+    y_pred = Yc_pred[:, i]
+    y_prob = Yc_prob_list[i][:, 1]  # positive class prob
 
-    cls_rep = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
-    cm = confusion_matrix(y_test, y_pred, labels=[0, 1]).tolist()
+    # Metrics 
+    roc = roc_auc_score(y_true, y_prob) 
+    pr  = average_precision_score(y_true, y_prob) 
+    cm  = confusion_matrix(y_true, y_pred, labels=[0, 1]).tolist()
 
-    print(f"{component.upper()} | {HORIZON}d Failure Prediction")
-    print("ROC-AUC:", metrics["roc_auc"], " PR-AUC:", metrics["pr_auc"])
-    print("Confusion Matrix:", cm)
+    print(f"- {comp.upper()}")
+    print("  ROC-AUC:", round(float(roc), 3)," PR-AUC:", round(float(pr), 3))
+    print("  Confusion Matrix [ [TN, FP], [FN, TP] ]:", cm)
+    per_comp_metrics[comp] = {"roc_auc": float(roc),"pr_auc":  float(pr),"cm": cm,}
 
-    importances = pd.Series(clf.feature_importances_, index=feature_cols).sort_values(ascending=False)
-    top20 = importances.head(20) * 100.0
-    plt.figure(); top20.iloc[::-1].plot(kind="barh")
-    plt.title(f"{component.upper()} — Top 20 Feature Importances ({HORIZON}d)")
-    plt.xlabel("Importance (%)"); plt.tight_layout()
-    plt.savefig(os.path.join(FIG_DIR, f"{component}_clf_featimp_{HORIZON}d.png"), dpi=150)
-    plt.close()
+# save model and feature list
+joblib.dump(clf_multi, os.path.join(ART_DIR, f"multi_label_rf_{HORIZON}d.joblib"))
+with open(os.path.join(ART_DIR, f"multi_label_features_{HORIZON}d.json"), "w") as f:
+    json.dump(feature_cols, f, indent=2)
 
-    with open(os.path.join(ART_DIR, f"{component}_cls_report_{HORIZON}d.json"), "w") as f:
-        json.dump(cls_rep, f, indent=2)
-    with open(os.path.join(ART_DIR, f"{component}_metrics_{HORIZON}d.json"), "w") as f:
-        json.dump(metrics, f, indent=2)
-    with open(os.path.join(ART_DIR, f"{component}_cm_{HORIZON}d.json"), "w") as f:
-        json.dump(cm, f, indent=2)
+# Regression
+df_reg = df_feat.copy()
 
-# Regression (XGBoost) 
+# Keep rows that either fail within 7 days OR have no future failure (NaN) for each component
+mask_any = pd.Series(True, index=df_reg.index)
+for col in RUL_LABEL_COLS:
+    mask = df_reg[col].isna() | (df_reg[col] <= RUL_CAP)
+    mask_any &= mask
 
-for component in COMPONENTS:
-    label_col = f"{component}_RUL_days"
-    df_local = df_feat.copy()
+df_reg = df_reg.loc[mask_any].copy()
+for col in RUL_LABEL_COLS:
+    df_reg[col] = df_reg[col].clip(upper=RUL_CAP).fillna(RUL_CAP)
 
-    # Keep rows that either fail within 7 days OR have no future failure (NaN)
-    mask_keep = df_local[label_col].isna() | (df_local[label_col] <= RUL_CAP)
-    df_local = df_local.loc[mask_keep].copy()
-    df_local[label_col] = df_local[label_col].clip(upper=RUL_CAP).fillna(RUL_CAP)
+cutoff_ts_r, Xr_train, Xr_test, Yr_train, Yr_test = chronological_split(df_reg, feature_cols, RUL_LABEL_COLS)
 
-    feature_cols = select_features(df_local, extra_keep=[label_col])
-    df_model = df_local.dropna(subset=feature_cols).copy()
+# Multi-output regressor (XGBoost)
+xgb = XGBRegressor(n_estimators=800,learning_rate=0.05,max_depth=8, subsample=0.9,colsample_bytree=0.8,reg_lambda=1.0,reg_alpha=0.0,random_state=RANDOM_STATE,n_jobs=-1,
+    eval_metric="rmse")
+reg_multi = MultiOutputRegressor(xgb, n_jobs=None)
+reg_multi.fit(Xr_train, Yr_train)
 
-    cutoff_ts, X_train, X_test, y_train, y_test = chronological_split(df_model, feature_cols, label_col)
+Yr_pred = pd.DataFrame(reg_multi.predict(Xr_test), columns=RUL_LABEL_COLS, index=Yr_test.index)
 
-    reg = XGBRegressor(n_estimators=800,learning_rate=0.05,max_depth=8,subsample=0.9,colsample_bytree=0.8, reg_lambda=1.0,
-    reg_alpha=0.0, random_state=RANDOM_STATE, n_jobs=-1, eval_metric="rmse")
+print("\n=== Multi-output Regressor — RUL (engine/battery/brake) ===")
+for i, comp in enumerate(COMPONENTS):
+    label = f"{comp}_RUL_days"
+    mae  = mean_absolute_error(Yr_test[label], Yr_pred[label])
+    rmse = np.sqrt(mean_squared_error(Yr_test[label], Yr_pred[label]))
+    print(f"- {comp.upper()}  MAE: {mae:.3f}  RMSE: {rmse:.3f}")
 
-    reg.fit(X_train, y_train,eval_set=[(X_test, y_test)],verbose=False)
+# Save regressor and feature list
+joblib.dump(reg_multi, os.path.join(ART_DIR, f"multi_output_xgb_reg_{HORIZON}d_cap{RUL_CAP}.joblib"))
+with open(os.path.join(ART_DIR, f"multi_output_reg_features_{HORIZON}d_cap{RUL_CAP}.json"), "w") as f:
+    json.dump(feature_cols, f, indent=2)
 
-    y_pred = reg.predict(X_test)
-    mae = float(mean_absolute_error(y_test, y_pred))
-    rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
 
-    print(f"=== {component.upper()} — RUL Regression (XGBoost) ===")
-    print("MAE:", round(mae, 3), " RMSE:", round(rmse, 3))
 
-    importances = pd.Series(reg.feature_importances_, index=feature_cols).sort_values(ascending=False)
-    top20 = importances.head(20) * 100.0
-    plt.figure(); top20.iloc[::-1].plot(kind="barh")
-    plt.title(f"{component.upper()} — Top 20 Feature Importances (RUL, XGBoost)")
-    plt.xlabel("Importance (%)"); plt.tight_layout()
-    plt.savefig(os.path.join(FIG_DIR, f"{component}_rul_featimp_xgb.png"), dpi=150)
-    plt.close()
+# Single-Row Prediction
+FEATURES_CSV_PATH = os.path.join(OUT_DIR, "telemetry_labeled_with_features_7d.csv")
 
+def predict_all_from_dataset_position(vehicle_id, pos_idx):
+ 
+    clf_path  = os.path.join(ART_DIR, f"multi_label_rf_{HORIZON}d.joblib")
+    reg_path  = os.path.join(ART_DIR, f"multi_output_xgb_reg_{HORIZON}d_cap{RUL_CAP}.joblib")
+    feats_path = os.path.join(ART_DIR, f"multi_label_features_{HORIZON}d.json")  # same features for both
+
+    clf_multi = joblib.load(clf_path)
+    reg_multi = joblib.load(reg_path)
+    feature_cols = json.load(open(feats_path))
+
+    df_all = pd.read_csv(FEATURES_CSV_PATH)
+    if "timestamp" in df_all.columns:
+        df_all["timestamp"] = pd.to_datetime(df_all["timestamp"], errors="coerce")
+
+    vdf = df_all[df_all["vehicle_id"] == vehicle_id].sort_values("timestamp").reset_index(drop=True)
+    row = vdf.iloc[[pos_idx]].copy()
+    X = row[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # Classification: list of 3 prob arrays
+    prob_list = clf_multi.predict_proba(X)
+    preds = clf_multi.predict(X)[0]
+
+    cls_probs = {comp: float(prob_list[i][0, 1]) for i, comp in enumerate(COMPONENTS)}
+    cls_preds = {comp: int(preds[i]) for i, comp in enumerate(COMPONENTS)}
+
+    # Regression: 3 preds
+    rul_preds = reg_multi.predict(X)[0]
+    rul = {comp: float(rul_preds[i]) for i, comp in enumerate(COMPONENTS)}
+
+    # Ground truth for comparison (if present)
+    value = {
+        f"{comp}_fail_in_next_{HORIZON}d": (None if pd.isna(row.get(f"{comp}_fail_in_next_{HORIZON}d", pd.Series([np.nan])).values[0])
+                                            else int(row[f"{comp}_fail_in_next_{HORIZON}d"].values[0]))
+        for comp in COMPONENTS
+    }
+    for comp in COMPONENTS:
+        k = f"{comp}_RUL_days"
+        val = row.get(k, pd.Series([np.nan])).values[0]
+        value[k] = None if pd.isna(val) else float(val)
+
+    return {
+        "vehicle_id": vehicle_id,
+        "row_index_for_vehicle": pos_idx,
+        "timestamp": str(row["timestamp"].values[0]) if "timestamp" in row.columns else None,
+        "pred_fail_in_next_7d": cls_preds,
+        "pred_rul_days": rul,
+        "true_labels": value,
+    }
+
+result = predict_all_from_dataset_position(vehicle_id="VEH0000", pos_idx=8)
+print(json.dumps(result, indent=2))
 
 # Artifact Index 
-
 index = {
     "source_dataset": os.path.abspath(CSV_PATH),
     "components": COMPONENTS,
     "horizon": HORIZON,
     "labeled_csv": os.path.join(OUT_DIR, "telemetry_labeled_7d.csv"),
     "features_csv": os.path.join(OUT_DIR, "telemetry_labeled_with_features_7d.csv"),
+    "multi_label_model": os.path.join(ART_DIR, f"multi_label_rf_{HORIZON}d.joblib"),
+    "multi_output_reg_model": os.path.join(ART_DIR, f"multi_output_xgb_reg_{HORIZON}d_cap{RUL_CAP}.joblib"),
 }
 with open(os.path.join(OUT_DIR, "ARTIFACTS_INDEX.json"), "w") as f:
     json.dump(index, f, indent=2)
 
-print("\nDone. Trained 3 classification models (7d) and 3 XGBoost regression models.")
+print("\nDone. Trained ONE multi-label classifier and ONE multi-output regressor.")
 print("Artifacts under:", os.path.abspath(OUT_DIR))
 print("Saved labeled data:", index['labeled_csv'])
 print("Saved labeled + features:", index['features_csv'])
+print("Classifier:", index['multi_label_model'])
+print("Regressor:", index['multi_output_reg_model'])
