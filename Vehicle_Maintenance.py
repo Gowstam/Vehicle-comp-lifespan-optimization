@@ -1,7 +1,7 @@
 """
 Predictive Maintenance — 7-Day
-- ONE classification model (multi-label): predicts fail_in_next_7d for engine, battery, brake
-- ONE regression model (multi-output): predicts RUL_days for engine, battery, brake (XGBoost)
+- classification model (multi-label): predicts fail_in_next_7d for engine, battery, brake
+- regression model (multi-output): predicts RUL_days for engine, battery, brake (XGBoost)
 - Keeps your preprocessing + feature engineering
 """
 
@@ -17,11 +17,12 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
 from sklearn.metrics import (classification_report, confusion_matrix, roc_auc_score, average_precision_score, mean_absolute_error, mean_squared_error)
 from xgboost import XGBRegressor
+from sklearn.multioutput import MultiOutputClassifier
+from imblearn.over_sampling import RandomOverSampler
 import joblib
 
 # Configuration 
-CSV_PATH = os.environ.get("CSV_PATH","/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/synthetic_telemetry_data.csv",
-)
+CSV_PATH = os.environ.get("CSV_PATH","/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/synthetic_telemetry_data.csv")
 OUT_DIR = os.environ.get("OUT_DIR", "/Users/gowthamsivaraman/Desktop/Vehicle Maintenance Project/output_simple")
 FIG_DIR = os.path.join(OUT_DIR, "figures")
 ART_DIR = os.path.join(OUT_DIR, "artifacts")
@@ -31,7 +32,7 @@ for d in [OUT_DIR, FIG_DIR, ART_DIR]:
 COMPONENTS = ["engine", "battery", "brake"]
 HORIZON = 7
 # For training target capping of RUL:
-RUL_CAP = 30
+RUL_CAP = 60
 RANDOM_STATE = 42
 
 # Timestamp & Failure Date 
@@ -71,11 +72,6 @@ def build_component_labels(input_df,component, horizon_days,include_today):
     """
     df_tmp = daily_timestamps(input_df)
 
-    # normalize boolean flags
-    for c in ["abs_fault_indicator", "engine_failure_imminent", "brake_issue_imminent", "battery_issue_imminent"]:
-        if c in df_tmp.columns:
-            df_tmp[c] = pd.to_numeric(df_tmp[c], errors="coerce").fillna(0).astype(int)
-
     token = f"{component}_failed"
     df_tmp[f"{component}_failed"] = (df_tmp.get("failure_type").astype(str).str.lower().str.strip()
                                      .str.contains(fr"\b{re.escape(token)}\b", regex=True, na=False).astype(int))
@@ -113,7 +109,7 @@ def build_component_labels(input_df,component, horizon_days,include_today):
 # Columns never to use as features
 EXCLUDE_ALWAYS = {"timestamp", "vehicle_id", "failure_type", "failure_date","brand", "date_norm", "next_fail_date"}
 
-def select_features(df_feat, extra_keep):
+def select_features(df_feat, extra_remove):
     exclude_cols = set(EXCLUDE_ALWAYS)
 
     leakage_cols = []
@@ -125,8 +121,8 @@ def select_features(df_feat, extra_keep):
             leakage_cols.append(s)
         if s in ("engine_failed", "battery_failed", "brake_failed"):
             leakage_cols.append(s)
-    if extra_keep:
-        leakage_cols.extend(extra_keep)
+    if extra_remove:
+        leakage_cols.extend(extra_remove)
 
     exclude_cols.update(leakage_cols)
 
@@ -260,35 +256,55 @@ df_labeled_all.to_csv(labeled_csv, index=False)
 
 df_feat = add_features(df_labeled_all)
 df_feat = df_feat.replace([np.inf, -np.inf], np.nan)
+print(df_feat.shape)
 
-features_csv = os.path.join(OUT_DIR, "telemetry_labeled_with_features_7d.csv")
-df_feat.to_csv(features_csv, index=False)
 
 # Build Targets
 # Classification labels (3 columns)
 CLS_LABEL_COLS = [f"{c}_fail_in_next_{HORIZON}d" for c in COMPONENTS]
 # Regression labels (3 columns)
 RUL_LABEL_COLS = [f"{c}_RUL_days" for c in COMPONENTS]
+for col in RUL_LABEL_COLS:
+    if col in df_feat.columns:
+        df_feat[col] = df_feat[col].fillna(0)
+features_csv = os.path.join(OUT_DIR, "telemetry_labeled_with_features_7d.csv")
+df_feat.to_csv(features_csv, index=False)
 
 # Feature Selection 
 all_labels = CLS_LABEL_COLS + RUL_LABEL_COLS
-feature_cols = select_features(df_feat, extra_keep=all_labels)
+feature_cols = select_features(df_feat, extra_remove=all_labels)
 
 df_feat[feature_cols] = (df_feat[feature_cols].replace([np.inf, -np.inf], np.nan).clip(-1e6, 1e6))
 
-# Classification
+# Multi-label classifier 
 df_cls = df_feat.dropna(subset=CLS_LABEL_COLS).copy()
 for col in CLS_LABEL_COLS:
     df_cls[col] = df_cls[col].astype(int)
 
 cutoff_ts, Xc_train, Xc_test, Yc_train, Yc_test = chronological_split(df_cls, feature_cols, CLS_LABEL_COLS)
 
-# Multi-label classifier (3 binary outputs)
-base_rf = RandomForestClassifier(n_estimators=400,max_depth=None,class_weight="balanced_subsample",random_state=RANDOM_STATE,n_jobs=-1)
-clf_multi = MultiOutputClassifier(base_rf, n_jobs=None)
-clf_multi.fit(Xc_train, Yc_train)
+eng = Yc_train.iloc[:, 0].astype(int).values  # engine_fail_in_next_7d
+bat = Yc_train.iloc[:, 1].astype(int).values  # battery_fail_in_next_7d
+brk = Yc_train.iloc[:, 2].astype(int).values  # brake_fail_in_next_7d
+y_key = (eng << 2) | (bat << 1) | brk          # values 0,1..7 (000,001,010,..)
 
-Yc_prob_list = clf_multi.predict_proba(Xc_test)
+# Oversample the target
+ros = RandomOverSampler(random_state=RANDOM_STATE)
+Xc_train_os, y_key_os = ros.fit_resample(Xc_train, y_key)
+
+# Unpack back into three binary labels after oversampling
+eng_os = ((y_key_os >> 2) & 1).astype(int)
+bat_os = ((y_key_os >> 1) & 1).astype(int)
+brk_os = (y_key_os & 1).astype(int)
+Yc_train_os = pd.DataFrame(np.column_stack([eng_os, bat_os, brk_os]), columns=CLS_LABEL_COLS)
+
+# Fit a multi-label classifier (3 binary outputs)
+base_rf = RandomForestClassifier(n_estimators=400, max_depth=None, class_weight="balanced_subsample",random_state=RANDOM_STATE,
+    n_jobs=-1)
+clf_multi = MultiOutputClassifier(base_rf, n_jobs=None)
+clf_multi.fit(Xc_train_os, Yc_train_os)
+
+Yc_prob_list = clf_multi.predict_proba(Xc_test)  # list of 3 arrays 
 Yc_pred = clf_multi.predict(Xc_test)
 
 print("\n===  Multi-label Classifier — 7d Failures (engine/battery/brake) ===")
@@ -298,24 +314,27 @@ for i, comp in enumerate(COMPONENTS):
     y_pred = Yc_pred[:, i]
     y_prob = Yc_prob_list[i][:, 1]  # positive class prob
 
-    # Metrics 
-    roc = roc_auc_score(y_true, y_prob) 
-    pr  = average_precision_score(y_true, y_prob) 
+    # Metrics
+    roc = roc_auc_score(y_true, y_prob)
+    pr  = average_precision_score(y_true, y_prob)
     cm  = confusion_matrix(y_true, y_pred, labels=[0, 1]).tolist()
 
     print(f"- {comp.upper()}")
-    print("  ROC-AUC:", round(float(roc), 3)," PR-AUC:", round(float(pr), 3))
+    print("  ROC-AUC:", round(float(roc), 3), " PR-AUC:", round(float(pr), 3))
     print("  Confusion Matrix [ [TN, FP], [FN, TP] ]:", cm)
-    per_comp_metrics[comp] = {"roc_auc": float(roc),"pr_auc":  float(pr),"cm": cm,}
+    per_comp_metrics[comp] = {
+        "roc_auc": float(roc),
+        "pr_auc":  float(pr),
+        "cm": cm,
+    }
 
-# save model and feature list
+# save model and feature list 
 joblib.dump(clf_multi, os.path.join(ART_DIR, f"multi_label_rf_{HORIZON}d.joblib"))
 with open(os.path.join(ART_DIR, f"multi_label_features_{HORIZON}d.json"), "w") as f:
     json.dump(feature_cols, f, indent=2)
 
 # Regression
 df_reg = df_feat.copy()
-
 # Keep rows that either fail within 7 days OR have no future failure (NaN) for each component
 mask_any = pd.Series(True, index=df_reg.index)
 for col in RUL_LABEL_COLS:
