@@ -1,0 +1,19 @@
+[
+  "engine_hours_roll14_std",
+  "vibration_level_slope14",
+  "engine_hours_roll14_mean",
+  "coolant_temp_c_roll14_std",
+  "engine_temp_c_slope14",
+  "exhaust_gas_temp_c_slope14",
+  "battery_voltage_v_roll14_std",
+  "engine_hours_slope14",
+  "odometer_reading_roll14_mean",
+  "engine_hours_cum_negdiff1",
+  "battery_health_percent_roll14_mean",
+  "coolant_temp_c_roll14_mean",
+  "brake_temp_c_roll14_std",
+  "coolant_temp_c_slope14",
+  "brake_issue_imminent_sum14",
+  "coolant_temp_c_cum_negdiff1",
+  "wheel_speed_fr_kph_cum_negdiff1"
+]
