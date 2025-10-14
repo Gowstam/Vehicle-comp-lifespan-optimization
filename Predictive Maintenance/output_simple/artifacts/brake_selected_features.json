@@ -1,0 +1,17 @@
+[
+  "wheel_speed_fr_kph_cum_negdiff1",
+  "exhaust_gas_temp_c_cum_negdiff1",
+  "battery_current_a_cum_negdiff1",
+  "engine_load_percent_cum_negdiff1",
+  "fuel_consumption_lph_cum_negdiff1",
+  "wheel_speed_rr_kph_cum_negdiff1",
+  "throttle_pos_percent_cum_negdiff1",
+  "brake_pad_wear_mm_roll14_mean",
+  "battery_charge_percent_cum_negdiff1",
+  "wheel_speed_fl_kph_cum_negdiff1",
+  "fuel_level_percent_cum_negdiff1",
+  "vehicle_speed_kph_cum_negdiff1",
+  "ambient_temp_c_cum_negdiff1",
+  "vibration_level_cum_negdiff1",
+  "brake_temp_c_cum_negdiff1"
+]
